@@ -1,6 +1,9 @@
 /target
 firmware/*/target
 web/dist/
+/.cargo-local/
+/.rustup/
+/.local/
 *.db
 *.db-journal
 .DS_Store
