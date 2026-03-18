@@ -71,6 +71,11 @@ pub struct CronAddBody {
     pub command: String,
 }
 
+#[derive(serde::Serialize)]
+pub struct YuanqiSessionMessagesResponse {
+    pub messages: Vec<crate::gateway::yuanqi::YuanqiStoredMessage>,
+}
+
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
@@ -383,6 +388,29 @@ pub async fn handle_api_integrations(
         .collect();
 
     Json(serde_json::json!({"integrations": integrations})).into_response()
+}
+
+/// GET /api/yuanqi/sessions/:session_id/messages — load persisted Yuanqi chat messages
+pub async fn handle_api_yuanqi_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let workspace_dir = state.config.lock().workspace_dir.clone();
+    match crate::gateway::yuanqi::load_messages(&workspace_dir, &session_id) {
+        Ok(messages) => Json(YuanqiSessionMessagesResponse { messages }).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Failed to load Yuanqi session messages: {error}")
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/integrations/settings — return per-integration settings (enabled + category)

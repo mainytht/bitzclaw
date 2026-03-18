@@ -10,6 +10,7 @@
 //! ```
 
 use super::AppState;
+use crate::agent::prompt::{PromptContext, PromptSection, SystemPromptBuilder};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -31,6 +32,32 @@ const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
 pub struct WsQuery {
     pub token: Option<String>,
     pub session_id: Option<String>,
+}
+
+struct YuanqiChannelPromptSection {
+    session_id: Option<String>,
+}
+
+impl PromptSection for YuanqiChannelPromptSection {
+    fn name(&self) -> &str {
+        "yuanqi_channel"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> anyhow::Result<String> {
+        let session_id = self.session_id.as_deref().unwrap_or("");
+        Ok(format!(
+            "## Yuanqi Channel\n\n\
+             You are responding inside the internal `yuanqi` web chat channel.\n\
+             Treat this page like a real chat channel similar to Telegram/Discord, not like a transient dashboard.\n\
+             Current reply target/session_id: `{session_id}`.\n\
+             If the user asks for a delayed reminder or follow-up to appear back in this same chat page,\n\
+             use `cron_add` with an agent job and set:\n\
+             - `session_target`: `main`\n\
+             - `delivery`: {{\"mode\":\"announce\",\"channel\":\"yuanqi\",\"to\":\"{session_id}\"}}\n\
+             The Yuanqi page itself is a valid delivery channel, so do not say the result can only go to logs or external apps.\n\
+             When scheduling a reminder, write the reminder prompt so the future message directly addresses the user in this conversation."
+        ))
+    }
 }
 
 /// Extract a bearer token from WebSocket-compatible sources.
@@ -116,8 +143,17 @@ pub async fn handle_ws_chat(
         .into_response()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<String>) {
+async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<String>) {
     let (mut sender, mut receiver) = socket.split();
+    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let writer_handle = tokio::spawn(async move {
+        while let Some(payload) = outgoing_rx.recv().await {
+            if sender.send(Message::Text(payload.into())).await.is_err() {
+                break;
+            }
+        }
+    });
 
     // Build a persistent Agent for this connection so history is maintained across turns.
     let config = state.config.lock().clone();
@@ -125,10 +161,39 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
         Ok(a) => a,
         Err(e) => {
             let err = serde_json::json!({"type": "error", "message": format!("Failed to initialise agent: {e}")});
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            let _ = outgoing_tx.send(err.to_string());
+            let _ = writer_handle.await;
             return;
         }
     };
+    agent.set_memory_session_id(session_id.clone());
+    agent.set_prompt_builder(
+        SystemPromptBuilder::with_defaults().add_section(Box::new(YuanqiChannelPromptSection {
+            session_id: session_id.clone(),
+        })),
+    );
+
+    let subscriber_handle = session_id.clone().map(|current_session_id| {
+        let mut subscription = crate::gateway::yuanqi::subscribe(&current_session_id);
+        let outgoing_tx = outgoing_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match subscription.recv().await {
+                    Ok(message) => {
+                        let payload = serde_json::json!({
+                            "type": "channel_message",
+                            "message": message,
+                        });
+                        if outgoing_tx.send(payload.to_string()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    });
 
     while let Some(msg) = receiver.next().await {
         let msg = match msg {
@@ -142,7 +207,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             Ok(v) => v,
             Err(_) => {
                 let err = serde_json::json!({"type": "error", "message": "Invalid JSON"});
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = outgoing_tx.send(err.to_string());
                 continue;
             }
         };
@@ -155,6 +220,18 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
         let content = parsed["content"].as_str().unwrap_or("").to_string();
         if content.is_empty() {
             continue;
+        }
+
+        if let Some(ref current_session_id) = session_id {
+            if let Err(error) = crate::gateway::yuanqi::persist_message(
+                &config.workspace_dir,
+                current_session_id,
+                "user",
+                &content,
+                "user",
+            ) {
+                tracing::warn!("Failed to persist Yuanqi user message: {error}");
+            }
         }
 
         // Process message with the LLM provider
@@ -175,12 +252,34 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
         // Multi-turn chat via persistent Agent (history is maintained across turns)
         match agent.turn(&content).await {
             Ok(response) => {
+                let mut response_created_at: Option<String> = None;
+                let mut response_message_id: Option<String> = None;
+                if let Some(ref current_session_id) = session_id {
+                    match crate::gateway::yuanqi::persist_message(
+                        &config.workspace_dir,
+                        current_session_id,
+                        "assistant",
+                        &response,
+                        "assistant",
+                    ) {
+                        Ok(stored) => {
+                            response_created_at = Some(stored.created_at);
+                            response_message_id = Some(stored.id);
+                        }
+                        Err(error) => {
+                            tracing::warn!("Failed to persist Yuanqi assistant message: {error}");
+                        }
+                    }
+                }
+
                 // Send the full response as a done message
                 let done = serde_json::json!({
                     "type": "done",
                     "full_response": response,
+                    "message_id": response_message_id,
+                    "created_at": response_created_at,
                 });
-                let _ = sender.send(Message::Text(done.to_string().into())).await;
+                let _ = outgoing_tx.send(done.to_string());
 
                 // Broadcast agent_end event
                 let _ = state.event_tx.send(serde_json::json!({
@@ -195,7 +294,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
                     "type": "error",
                     "message": sanitized,
                 });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                let _ = outgoing_tx.send(err.to_string());
 
                 // Broadcast error event
                 let _ = state.event_tx.send(serde_json::json!({
@@ -206,6 +305,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, _session_id: Option<S
             }
         }
     }
+
+    if let Some(handle) = subscriber_handle {
+        handle.abort();
+    }
+    drop(outgoing_tx);
+    let _ = writer_handle.await;
 }
 
 #[cfg(test)]
